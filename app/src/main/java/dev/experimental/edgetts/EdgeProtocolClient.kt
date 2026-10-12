@@ -21,10 +21,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Cliente WebSocket persistente: un socket para varios turnos SSML
- * (varios `onSynthesizeText` de Neo/Books). DRM y cabeceras salen de
- * [EdgeDrm]. El socket no se cierra en `turn.end`; si el servidor lo tira,
- * el siguiente turno reconecta.
+ * Persistent WebSocket client: one socket for several SSML turns.
+ * Changes in this build:
+ *  - callbacks from a socket that is no longer the current one are ignored
+ *    (so dropping an old socket can never fail a newer turn);
+ *  - a socket idle for more than REUSE_MAX_IDLE_MS is not reused;
+ *  - if the server sends nothing for IDLE_TIMEOUT_MS before any audio,
+ *    one silent reconnect is attempted before failing.
  */
 class EdgeProtocolClient(
     private val client: OkHttpClient,
@@ -60,6 +63,9 @@ class EdgeProtocolClient(
 
     @Volatile
     private var current: Session? = null
+
+    @Volatile
+    private var lastActivityMs: Long = 0L
 
     private var connectionId: String = newId()
     private var muid: String = drm.newMuid()
@@ -153,7 +159,8 @@ class EdgeProtocolClient(
             synchronized(connLock) {
                 current = this
                 val open = socket
-                if (connectionOpen && open != null) {
+                val idleMs = System.currentTimeMillis() - lastActivityMs
+                if (connectionOpen && open != null && idleMs <= REUSE_MAX_IDLE_MS) {
                     lastReuse = true
                     AppLog.i(TAG) { "persist hit request=$requestId" }
                     logDiag("persist=hit")
@@ -165,6 +172,10 @@ class EdgeProtocolClient(
                         connectLocked()
                     }
                     return
+                }
+                if (open != null) {
+                    AppLog.i(TAG) { "persist stale idle=${idleMs}ms, reconnecting" }
+                    dropSocketLocked()
                 }
                 lastReuse = false
                 AppLog.i(TAG) { "persist miss, connecting request=$requestId" }
@@ -340,6 +351,7 @@ class EdgeProtocolClient(
 
         private fun bumpWatchdog() {
             if (finished.get() || cancelled.get()) return
+            lastActivityMs = System.currentTimeMillis()
             scheduleWatchdog()
         }
 
@@ -347,16 +359,29 @@ class EdgeProtocolClient(
             watchdog?.cancel(false)
             watchdog = WATCHDOG.schedule(
                 {
-                    synchronized(connLock) { dropSocketLocked() }
-                    fail(
-                        TimeoutException(
-                            "La síntesis estuvo " +
-                                (EdgeProtocolConstants.IDLE_TIMEOUT_MS / 1000) +
-                                " s sin datos del servidor"
-                        )
-                    )
+                    if (!isDone()) {
+                        if (!receivedAudio.get() &&
+                            attempts.incrementAndGet() <= EdgeProtocolConstants.MAX_AUTO_RETRIES
+                        ) {
+                            AppLog.i(TAG) { "watchdog: no data, one silent retry" }
+                            logDiag("watchdog sin datos → reconexión única")
+                            synchronized(connLock) {
+                                dropSocketLocked()
+                                connectLocked()
+                            }
+                        } else {
+                            synchronized(connLock) { dropSocketLocked() }
+                            fail(
+                                TimeoutException(
+                                    "La síntesis estuvo " +
+                                        (IDLE_TIMEOUT_MS / 1000) +
+                                        " s sin datos del servidor"
+                                )
+                            )
+                        }
+                    }
                 },
-                EdgeProtocolConstants.IDLE_TIMEOUT_MS,
+                IDLE_TIMEOUT_MS,
                 TimeUnit.MILLISECONDS
             )
         }
@@ -364,6 +389,7 @@ class EdgeProtocolClient(
         private fun finishOk() {
             if (!finished.compareAndSet(false, true)) return
             watchdog?.cancel(false)
+            lastActivityMs = System.currentTimeMillis()
             synchronized(connLock) {
                 if (current === this) current = null
             }
@@ -440,15 +466,28 @@ class EdgeProtocolClient(
 
     private val listener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
-            synchronized(connLock) { connectionOpen = true }
-            current?.onSocketOpen(webSocket)
+            var turn: Session? = null
+            var stale = false
+            synchronized(connLock) {
+                if (socket === webSocket) {
+                    connectionOpen = true
+                    turn = current
+                } else {
+                    stale = true
+                }
+            }
+            if (stale) return
+            val t = turn
+            t?.onSocketOpen(webSocket)
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
+            if (socket !== webSocket) return
             current?.onText(text)
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            if (socket !== webSocket) return
             current?.onBinary(bytes)
         }
 
@@ -457,30 +496,45 @@ class EdgeProtocolClient(
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            val turn = current
+            var turn: Session? = null
+            var stale = false
             synchronized(connLock) {
                 if (socket === webSocket) {
                     connectionOpen = false
                     socket = null
+                    turn = current
+                } else {
+                    stale = true
                 }
             }
-            if (turn != null && !turn.isDone()) {
-                turn.onPeerClosed(code, reason)
+            if (stale) return
+            val t = turn
+            if (t != null && !t.isDone()) {
+                t.onPeerClosed(code, reason)
             } else {
                 AppLog.i(TAG) { "socket idle closed code=$code reason='${reason.take(40)}'" }
             }
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            val turn = current
+            var turn: Session? = null
+            var stale = false
             synchronized(connLock) {
                 if (socket === webSocket) {
                     connectionOpen = false
                     socket = null
+                    turn = current
+                } else {
+                    stale = true
                 }
             }
-            if (turn != null && !turn.isDone()) {
-                turn.onPeerFailure(t, response)
+            if (stale) {
+                runCatching { response?.body?.close() }
+                return
+            }
+            val s = turn
+            if (s != null && !s.isDone()) {
+                s.onPeerFailure(t, response)
             } else {
                 AppLog.i(TAG) { "socket idle failure ${t.javaClass.simpleName}" }
             }
@@ -489,6 +543,12 @@ class EdgeProtocolClient(
 
     companion object {
         private const val TAG = "EdgeTtsClient"
+
+        /** Silence from the server (no frame at all) longer than this = timeout. */
+        private const val IDLE_TIMEOUT_MS: Long = 30_000L
+
+        /** A persistent socket idle longer than this is dropped, not reused. */
+        private const val REUSE_MAX_IDLE_MS: Long = 10_000L
 
         private val WATCHDOG: ScheduledExecutorService =
             Executors.newSingleThreadScheduledExecutor { r ->
