@@ -19,15 +19,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Drop-in replacement of the old WebSocket client (same public API).
- *
- * The Edge Read Aloud WebSocket stopped accepting the old Sec-MS-GEC token
- * (Oct 2026). This version does what the Bing Translator web page does:
- *   1. GET  https://www.bing.com/translator  -> IG, IID, abuse-prevention token
- *   2. POST /tfetspktok                      -> short-lived speech token + region
- *   3. POST https://<region>.tts.speech.microsoft.com/cognitiveservices/v1
- *            with the SSML  -> MP3 audio (streamed to the caller)
- *
- * Unofficial: it may stop working whenever Microsoft changes the web page.
+ * Uses the Bing Translator page to obtain a speech token, then calls the
+ * regular Azure TTS REST endpoint. Unofficial: may stop working at any time.
  */
 class EdgeProtocolClient(
     private val client: OkHttpClient,
@@ -75,6 +68,9 @@ class EdgeProtocolClient(
 
     @Volatile
     private var pageHost: String = "www.bing.com"
+
+    private var pageHtml: String = ""
+    private var pageUrlFinal: HttpUrl? = null
 
     override fun synthesize(
         text: String,
@@ -163,6 +159,8 @@ class EdgeProtocolClient(
             pageKey = abuse.groupValues[1]
             pageToken = abuse.groupValues[2]
             pageHost = finalUrl.host
+            pageHtml = html
+            pageUrlFinal = finalUrl
             iidCounter = 0
         }
     }
@@ -188,6 +186,7 @@ class EdgeProtocolClient(
             val text = resp.body?.string().orEmpty()
             diag("tfetspktok http=${resp.code} bytes=${text.length}")
             if (!resp.isSuccessful) {
+                discoverLocked(diag)
                 throw ProviderHttpException(resp.code, "speech token HTTP ${resp.code}")
             }
             val json = try {
@@ -208,6 +207,64 @@ class EdgeProtocolClient(
             Auth(token, region)
         }
         return result
+    }
+
+    // ------------------------------------------------------------- discovery
+
+    /**
+     * Diagnostic only: when the speech-token route answers 404 we look for the
+     * names of the current routes inside the Bing page and its scripts and put
+     * short excerpts into the diagnostics, so the new route can be identified.
+     */
+    private fun discoverLocked(diag: (String) -> Unit) {
+        try {
+            val keywords = listOf(
+                "tfetspktok", "tfettts", "spktok", "tts.speech.microsoft.com",
+                "cognitiveservices/v1", "ttsToken", "speechToken", "/tts"
+            )
+            scanText("html", pageHtml, keywords, diag)
+            val base = pageUrlFinal ?: return
+            val srcRe = Regex("<script[^>]+src=\"([^\"]+)\"")
+            val srcs = srcRe.findAll(pageHtml).map { it.groupValues[1] }.distinct().toList()
+            diag("scripts found=${srcs.size}")
+            var fetched = 0
+            for (src in srcs) {
+                if (fetched >= 6) break
+                val url = base.resolve(src) ?: continue
+                if (url.scheme != "https") continue
+                fetched++
+                try {
+                    val req = Request.Builder().url(url).header("User-Agent", userAgent).build()
+                    http.newCall(req).execute().use { r ->
+                        val js = r.body?.string().orEmpty()
+                        val name = url.encodedPath.substringAfterLast('/')
+                        diag("script $name http=${r.code} bytes=${js.length}")
+                        if (r.isSuccessful) scanText(name, js, keywords, diag)
+                    }
+                } catch (e: Exception) {
+                    diag("script fetch failed ${e.javaClass.simpleName}")
+                }
+            }
+        } catch (e: Exception) {
+            diag("discovery error ${e.javaClass.simpleName}")
+        }
+    }
+
+    private fun scanText(label: String, text: String, keywords: List<String>, diag: (String) -> Unit) {
+        for (kw in keywords) {
+            var from = 0
+            var shown = 0
+            while (shown < 2) {
+                val i = text.indexOf(kw, from)
+                if (i < 0) break
+                val a = maxOf(0, i - 70)
+                val b = minOf(text.length, i + kw.length + 110)
+                val ctx = text.substring(a, b).replace("\n", " ").replace("\r", " ")
+                diag("$label[$kw]: $ctx")
+                shown++
+                from = i + kw.length
+            }
+        }
     }
 
     // --------------------------------------------------------------- session
