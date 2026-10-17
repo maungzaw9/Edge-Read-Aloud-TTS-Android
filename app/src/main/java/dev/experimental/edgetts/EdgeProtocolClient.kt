@@ -1,33 +1,33 @@
 package dev.experimental.edgetts
 
-import android.util.Log
+import okhttp3.Call
+import okhttp3.Cookie
+import okhttp3.CookieJar
+import okhttp3.FormBody
+import okhttp3.HttpUrl
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
-import okio.ByteString
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.IOException
-import java.net.SocketTimeoutException
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Persistent WebSocket client: one socket for several SSML turns.
- * Changes in this build:
- *  - callbacks from a socket that is no longer the current one are ignored
- *    (so dropping an old socket can never fail a newer turn);
- *  - a socket idle for more than REUSE_MAX_IDLE_MS is not reused;
- *  - if the server sends nothing for IDLE_TIMEOUT_MS before any audio,
- *    one silent reconnect is attempted before failing.
+ * Drop-in replacement of the old WebSocket client (same public API).
+ *
+ * The Edge Read Aloud WebSocket stopped accepting the old Sec-MS-GEC token
+ * (Oct 2026). This version does what the Bing Translator web page does:
+ *   1. GET  https://www.bing.com/translator  -> IG, IID, abuse-prevention token
+ *   2. POST /tfetspktok                      -> short-lived speech token + region
+ *   3. POST https://<region>.tts.speech.microsoft.com/cognitiveservices/v1
+ *            with the SSML  -> MP3 audio (streamed to the caller)
+ *
+ * Unofficial: it may stop working whenever Microsoft changes the web page.
  */
 class EdgeProtocolClient(
     private val client: OkHttpClient,
@@ -49,26 +49,32 @@ class EdgeProtocolClient(
         token = trustedClientToken
     )
 
+    /** true when the speech token of the last turn came from the cache. */
     @Volatile
     var lastReuse: Boolean = false
         private set
 
-    private val connLock = Any()
+    private val http: OkHttpClient = client.newBuilder()
+        .cookieJar(MemoryCookieJar())
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .build()
+
+    private class Auth(val token: String, val region: String)
+
+    private val authLock = Any()
+    private var pageIg: String? = null
+    private var pageIid: String? = null
+    private var pageKey: String? = null
+    private var pageToken: String? = null
+    private var iidCounter = 0
+    private var authToken: String? = null
+    private var authRegion: String? = null
+    private var authExpiresAt: Long = 0L
 
     @Volatile
-    private var socket: WebSocket? = null
-
-    @Volatile
-    private var connectionOpen = false
-
-    @Volatile
-    private var current: Session? = null
-
-    @Volatile
-    private var lastActivityMs: Long = 0L
-
-    private var connectionId: String = newId()
-    private var muid: String = drm.newMuid()
+    private var pageHost: String = "www.bing.com"
 
     override fun synthesize(
         text: String,
@@ -104,19 +110,107 @@ class EdgeProtocolClient(
     }
 
     fun shutdown() {
-        synchronized(connLock) {
-            connectionOpen = false
-            current = null
-            val s = socket
-            socket = null
-            runCatching { s?.close(1000, "shutdown") }
-        }
+        // Nothing persistent to close: every turn is a plain HTTPS request.
     }
 
     inner class PreparedTurn internal constructor(private val session: Session) : Cancellable {
         fun start() = session.begin()
         override fun cancel() = session.cancel()
     }
+
+    // ------------------------------------------------------------ token flow
+
+    private fun getAuth(forceRefresh: Boolean, diag: (String) -> Unit): Auth =
+        synchronized(authLock) {
+            val now = System.currentTimeMillis()
+            val cached = authToken
+            if (!forceRefresh && cached != null && now < authExpiresAt - 30_000L) {
+                lastReuse = true
+                Auth(cached, authRegion ?: "southeastasia")
+            } else {
+                lastReuse = false
+                authToken = null
+                loadPageConfigLocked(diag)
+                requestTokenLocked(diag)
+            }
+        }
+
+    private fun loadPageConfigLocked(diag: (String) -> Unit) {
+        val req = Request.Builder()
+            .url(BING_PAGE_URL)
+            .header("User-Agent", userAgent)
+            .header("Accept", "text/html,application/xhtml+xml")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .build()
+        http.newCall(req).execute().use { resp ->
+            val finalUrl = resp.request.url
+            val html = resp.body?.string().orEmpty()
+            diag("page http=${resp.code} host=${finalUrl.host} bytes=${html.length}")
+            if (!resp.isSuccessful) {
+                throw ProviderHttpException(resp.code, "Bing page HTTP ${resp.code}")
+            }
+            val ig = IG_RE.find(html)?.groupValues?.get(1)
+            val iid = IID_RE.find(html)?.groupValues?.get(1)
+            val abuse = ABUSE_RE.find(html)
+            if (ig == null || iid == null || abuse == null) {
+                throw IOException(
+                    "Bing page format not recognised (ig=${ig != null}, " +
+                        "iid=${iid != null}, token=${abuse != null})"
+                )
+            }
+            pageIg = ig
+            pageIid = iid
+            pageKey = abuse.groupValues[1]
+            pageToken = abuse.groupValues[2]
+            pageHost = finalUrl.host
+            iidCounter = 0
+        }
+    }
+
+    private fun requestTokenLocked(diag: (String) -> Unit): Auth {
+        val ig = pageIg ?: throw IOException("missing IG")
+        val iid = pageIid ?: throw IOException("missing IID")
+        iidCounter += 1
+        val url = "https://$pageHost/tfetspktok?isVertical=1&IG=$ig&IID=$iid.$iidCounter"
+        val form = FormBody.Builder()
+            .add("token", pageToken ?: "")
+            .add("key", pageKey ?: "")
+            .build()
+        val req = Request.Builder()
+            .url(url)
+            .post(form)
+            .header("User-Agent", userAgent)
+            .header("Origin", "https://$pageHost")
+            .header("Referer", BING_PAGE_URL)
+            .header("Accept", "*/*")
+            .build()
+        val result: Auth = http.newCall(req).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            diag("tfetspktok http=${resp.code} bytes=${text.length}")
+            if (!resp.isSuccessful) {
+                throw ProviderHttpException(resp.code, "speech token HTTP ${resp.code}")
+            }
+            val json = try {
+                JSONObject(text)
+            } catch (e: Exception) {
+                throw IOException("speech token reply is not JSON: ${text.take(80)}")
+            }
+            val token = json.optString("token")
+            val region = json.optString("region")
+            if (token.isEmpty() || region.isEmpty()) {
+                throw IOException("speech token reply missing fields: ${text.take(120)}")
+            }
+            val ttl = json.optLong("expiryDurationInMS", 600_000L)
+            authToken = token
+            authRegion = region
+            authExpiresAt = System.currentTimeMillis() + ttl
+            diag("token ok region=$region ttl=${ttl / 1000}s")
+            Auth(token, region)
+        }
+        return result
+    }
+
+    // --------------------------------------------------------------- session
 
     inner class Session(
         private val text: String,
@@ -129,19 +223,13 @@ class EdgeProtocolClient(
         private val onError: (Throwable) -> Unit,
         private val onAudioMetadata: (String) -> Unit
     ) {
-        private val requestId = newId()
-
         private val finished = AtomicBoolean(false)
         private val cancelled = AtomicBoolean(false)
         private val receivedAudio = AtomicBoolean(false)
-        private val attempts = AtomicInteger(0)
-        private val gecRefreshes = AtomicInteger(0)
-
         private val diagLines = CopyOnWriteArrayList<String>()
-        private val binaryFramesSeen = AtomicInteger(0)
-        private val pathSequence = ArrayList<String>()
 
-        private var watchdog: ScheduledFuture<*>? = null
+        @Volatile
+        private var activeCall: Call? = null
 
         fun isDone(): Boolean = finished.get() || cancelled.get()
 
@@ -150,416 +238,148 @@ class EdgeProtocolClient(
         }
 
         private fun flushDiag() {
-            val text = diagLines.joinToString("\n")
-            if (text.isBlank()) return
-            DIAG_IO.execute { onDiagnostic?.invoke(text) }
+            val joined = diagLines.joinToString("\n")
+            if (joined.isBlank()) return
+            DIAG_IO.execute { onDiagnostic?.invoke(joined) }
         }
 
         fun begin() {
-            synchronized(connLock) {
-                current = this
-                val open = socket
-                val idleMs = System.currentTimeMillis() - lastActivityMs
-                if (connectionOpen && open != null && idleMs <= REUSE_MAX_IDLE_MS) {
-                    lastReuse = true
-                    AppLog.i(TAG) { "persist hit request=$requestId" }
-                    logDiag("persist=hit")
-                    scheduleWatchdog()
-                    if (!open.send(ssmlFrame())) {
-                        dropSocketLocked()
-                        lastReuse = false
-                        AppLog.i(TAG) { "persist send failed, reconnecting" }
-                        connectLocked()
-                    }
-                    return
-                }
-                if (open != null) {
-                    AppLog.i(TAG) { "persist stale idle=${idleMs}ms, reconnecting" }
-                    dropSocketLocked()
-                }
-                lastReuse = false
-                AppLog.i(TAG) { "persist miss, connecting request=$requestId" }
-                logDiag("persist=miss")
-                connectLocked()
-            }
-        }
-
-        private fun connectLocked() {
-            connectionId = newId()
-            muid = drm.newMuid()
-            val nowSeconds = drm.unixSeconds()
-            val gec = drm.generateSecMsGec(nowSeconds, trustedClientToken)
-            val url = drm.websocketUrl(
-                wsBaseUrl, connectionId, trustedClientToken, secMsGecVersion, nowSeconds
-            )
-            val request = Request.Builder().url(url)
-            for ((k, v) in drm.handshakeHeaders(userAgent, origin, muid)) {
-                request.header(k, v)
-            }
-            logDiag(
-                drm.handshakeDiagLine(
-                    gec, muid, origin, userAgent, secMsGecVersion,
-                    attempts.get() + 1 + gecRefreshes.get()
-                )
-            )
-            if (EdgeProtocolConstants.DEBUG_PROTOCOL) {
-                Log.d(TAG, "handshake: formato=$outputFormat voz=$voice")
-            }
-            socket = client.newWebSocket(request.build(), listener)
-            scheduleWatchdog()
+            WORKER.execute { run() }
         }
 
         fun cancel() {
             if (!cancelled.compareAndSet(false, true)) return
-            watchdog?.cancel(false)
-            synchronized(connLock) { dropSocketLocked() }
+            runCatching { activeCall?.cancel() }
             fail(SynthesisCancelledException())
         }
 
-        fun onSocketOpen(webSocket: WebSocket) {
-            bumpWatchdog()
-            webSocket.send(speechConfigFrame())
-            webSocket.send(ssmlFrame())
+        private fun run() {
+            try {
+                var code = 0
+                for (attempt in 0..1) {
+                    if (cancelled.get()) return
+                    val auth = getAuth(attempt > 0) { logDiag(it) }
+                    code = speak(auth)
+                    if (code == 0) break
+                    logDiag("token rejected http=$code, refreshing")
+                }
+                if (cancelled.get()) return
+                if (code != 0) {
+                    fail(ProviderHttpException(code, "HTTP $code: speech token rejected"))
+                    return
+                }
+                if (!receivedAudio.get()) {
+                    logDiag("no audio bytes received")
+                    fail(NoAudioReceivedException())
+                    return
+                }
+                finishOk()
+            } catch (t: Throwable) {
+                if (cancelled.get()) return
+                logDiag("error ${t.javaClass.simpleName}: ${t.message?.take(160)}")
+                fail(t)
+            }
         }
 
-        fun onText(text: String) {
-            bumpWatchdog()
-            val headers = AudioFrameParser.parseTextFrameHeaders(text)
-            val path = AudioFrameParser.pathOf(headers)
-            if (path != null) synchronized(pathSequence) { pathSequence += path }
-            when (path) {
-                EdgeProtocolConstants.PATH_TURN_START ->
-                    AppLog.i(TAG) { "turn.start recibido persist=${if (lastReuse) "hit" else "miss"}" }
-
-                EdgeProtocolConstants.PATH_TURN_END -> {
-                    if (receivedAudio.get()) {
-                        finishOk()
-                    } else {
-                        logDiag(
-                            "turn.end sin audio · frames binarios recibidos=" +
-                                binaryFramesSeen.get() + " · formato=$outputFormat"
-                        )
-                        fail(NoAudioReceivedException())
+        /** Returns 0 on success, or the HTTP code (401/403) when the token was rejected. */
+        private fun speak(auth: Auth): Int {
+            val ssml = SsmlBuilder.build(voice, locale, rate, pitch, text)
+            val url = "https://${auth.region}.tts.speech.microsoft.com/cognitiveservices/v1"
+            val req = Request.Builder()
+                .url(url)
+                .post(ssml.toRequestBody("application/ssml+xml; charset=utf-8".toMediaType()))
+                .header("Authorization", "Bearer ${auth.token}")
+                .header("X-Microsoft-OutputFormat", outputFormat)
+                .header("User-Agent", userAgent)
+                .header("Origin", "https://$pageHost")
+                .build()
+            val call = http.newCall(req)
+            activeCall = call
+            val result: Int = call.execute().use { resp ->
+                logDiag("tts http=${resp.code} voice=$voice")
+                if (resp.code == 401 || resp.code == 403) {
+                    return@use resp.code
+                }
+                if (!resp.isSuccessful) {
+                    val msg = resp.body?.string().orEmpty().take(120)
+                    throw ProviderHttpException(resp.code, "TTS HTTP ${resp.code} $msg")
+                }
+                val body = resp.body ?: throw IOException("empty TTS response")
+                val input = body.byteStream()
+                val buf = ByteArray(8192)
+                var total = 0
+                while (true) {
+                    if (cancelled.get()) return@use 0
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    if (n > 0) {
+                        total += n
+                        receivedAudio.set(true)
+                        onEncodedAudioChunk(buf.copyOf(n), 0, n)
                     }
                 }
-
-                EdgeProtocolConstants.PATH_AUDIO_METADATA -> {
-                    val body = AudioFrameParser.bodyOf(text)
-                    if (body.isNotEmpty()) onAudioMetadata(body)
-                }
-
-                EdgeProtocolConstants.PATH_RESPONSE -> {
-                    val body = AudioFrameParser.bodyOf(text)
-                    val status = STATUS_JSON.find(body)?.groupValues?.get(1)?.toIntOrNull()
-                    logDiag("Path:response status=${status ?: "n/d"} bytes=${body.length}")
-                    if (status != null && status >= 400) {
-                        fail(ProviderHttpException(status, "status $status"))
-                    }
-                }
-
-                else -> Unit
+                logDiag("audio bytes=$total")
+                0
             }
-        }
-
-        fun onBinary(bytes: ByteString) {
-            bumpWatchdog()
-            val n = binaryFramesSeen.incrementAndGet()
-            val frame = AudioFrameParser.parseBinaryFrame(bytes)
-            if (n <= 3) {
-                logDiag("binario#$n len=${bytes.size} path=${frame.path ?: "n/d"}")
-            }
-            if (frame.unexpectedAudioType()) {
-                logDiag(
-                    "Content-Type inesperado=${frame.contentType()} bytes=${frame.payloadLength}"
-                )
-            }
-            if (frame.path == EdgeProtocolConstants.PATH_AUDIO) {
-                if (frame.payloadLength > 0 && !cancelled.get()) {
-                    receivedAudio.set(true)
-                    onEncodedAudioChunk(frame.raw, frame.payloadOffset, frame.payloadLength)
-                }
-            } else if (frame.path == EdgeProtocolConstants.PATH_AUDIO_METADATA) {
-                val body = String(frame.payload, Charsets.UTF_8)
-                if (body.isNotEmpty()) onAudioMetadata(body)
-            }
-        }
-
-        fun onPeerClosed(code: Int, reason: String) {
-            if (finished.get() || cancelled.get()) return
-            val seq = synchronized(pathSequence) { pathSequence.toString() }
-            logDiag(
-                "EOF cierre=$code razón='${reason.take(40)}' · paths=[$seq]" +
-                    " · binarios=${binaryFramesSeen.get()} · audio=${receivedAudio.get()}" +
-                    " · formato=$outputFormat"
-            )
-            fail(
-                IOException(
-                    "EOF: el servidor cerró el WebSocket (código $code) " +
-                        "antes de completar la síntesis"
-                )
-            )
-        }
-
-        fun onPeerFailure(t: Throwable, response: Response?) {
-            if (finished.get() || cancelled.get()) return
-            val code = response?.code ?: -1
-            runCatching { response?.body?.close() }
-
-            if (code in EdgeProtocolConstants.PERMANENT_HTTP_ERRORS) {
-                if (code == 403 && !receivedAudio.get() &&
-                    gecRefreshes.getAndIncrement() == 0
-                ) {
-                    if (drm.tryUpdateSkewFromDate(response?.header("Date"))) {
-                        Log.w(
-                            TAG,
-                            "403 en handshake: deriva ajustada " +
-                                "(skew=${drm.skewSeconds()} s), renovación única"
-                        )
-                        logDiag("403 → renovación de contexto (deriva=${drm.skewSeconds()}s)")
-                        synchronized(connLock) {
-                            dropSocketLocked()
-                            connectLocked()
-                        }
-                        return
-                    }
-                    logDiag("403 → Date ausente o absurda, sin renovación")
-                }
-                logDiag("FALLO HTTP $code")
-                fail(ProviderHttpException(code, "HTTP $code"))
-                return
-            }
-
-            if (!receivedAudio.get() &&
-                attempts.incrementAndGet() <= EdgeProtocolConstants.MAX_AUTO_RETRIES
-            ) {
-                Log.w(TAG, "Fallo de red antes del audio: reintento único")
-                synchronized(connLock) {
-                    dropSocketLocked()
-                    connectLocked()
-                }
-                return
-            }
-
-            fail(
-                when {
-                    t is SocketTimeoutException -> t
-                    code > 0 -> ProviderHttpException(code, "HTTP $code")
-                    else -> t
-                }
-            )
-        }
-
-        private fun bumpWatchdog() {
-            if (finished.get() || cancelled.get()) return
-            lastActivityMs = System.currentTimeMillis()
-            scheduleWatchdog()
-        }
-
-        private fun scheduleWatchdog() {
-            watchdog?.cancel(false)
-            watchdog = WATCHDOG.schedule(
-                {
-                    if (!isDone()) {
-                        if (!receivedAudio.get() &&
-                            attempts.incrementAndGet() <= EdgeProtocolConstants.MAX_AUTO_RETRIES
-                        ) {
-                            AppLog.i(TAG) { "watchdog: no data, one silent retry" }
-                            logDiag("watchdog sin datos → reconexión única")
-                            synchronized(connLock) {
-                                dropSocketLocked()
-                                connectLocked()
-                            }
-                        } else {
-                            synchronized(connLock) { dropSocketLocked() }
-                            fail(
-                                TimeoutException(
-                                    "La síntesis estuvo " +
-                                        (IDLE_TIMEOUT_MS / 1000) +
-                                        " s sin datos del servidor"
-                                )
-                            )
-                        }
-                    }
-                },
-                IDLE_TIMEOUT_MS,
-                TimeUnit.MILLISECONDS
-            )
+            return result
         }
 
         private fun finishOk() {
             if (!finished.compareAndSet(false, true)) return
-            watchdog?.cancel(false)
-            lastActivityMs = System.currentTimeMillis()
-            synchronized(connLock) {
-                if (current === this) current = null
-            }
             flushDiag()
             onComplete()
         }
 
         private fun fail(t: Throwable) {
             if (!finished.compareAndSet(false, true)) return
-            watchdog?.cancel(false)
-            synchronized(connLock) {
-                if (current === this) current = null
-                if (t !is SynthesisCancelledException) dropSocketLocked()
-            }
             flushDiag()
             onError(t)
         }
-
-        private fun ssmlFrame(): String {
-            val ssml = SsmlBuilder.build(voice, locale, rate, pitch, text)
-            return buildString {
-                append("X-RequestId:").append(requestId)
-                append(EdgeProtocolConstants.CRLF)
-                append("Content-Type:application/ssml+xml")
-                append(EdgeProtocolConstants.CRLF)
-                append("X-Timestamp:").append(drm.jsTimestamp(withTrailingZ = true))
-                append(EdgeProtocolConstants.CRLF)
-                append("Path:").append(EdgeProtocolConstants.PATH_SSML)
-                append(EdgeProtocolConstants.CRLF)
-                append(EdgeProtocolConstants.CRLF)
-                append(ssml)
-            }
-        }
     }
 
-    private fun dropSocketLocked() {
-        connectionOpen = false
-        val s = socket
-        socket = null
-        runCatching { s?.cancel() }
-    }
+    // ------------------------------------------------------------ cookie jar
 
-    private fun speechConfigFrame(): String {
-        val config = JSONObject()
-            .put(
-                "context",
-                JSONObject().put(
-                    "synthesis",
-                    JSONObject().put(
-                        "audio",
-                        JSONObject()
-                            .put(
-                                "metadataoptions",
-                                JSONObject()
-                                    .put("sentenceBoundaryEnabled", "false")
-                                    .put("wordBoundaryEnabled", "false")
-                            )
-                            .put("outputFormat", outputFormat)
-                    )
-                )
-            )
-        return buildString {
-            append("X-Timestamp:").append(drm.jsTimestamp(withTrailingZ = false))
-            append(EdgeProtocolConstants.CRLF)
-            append("Content-Type:application/json; charset=utf-8")
-            append(EdgeProtocolConstants.CRLF)
-            append("Path:").append(EdgeProtocolConstants.PATH_SPEECH_CONFIG)
-            append(EdgeProtocolConstants.CRLF)
-            append(EdgeProtocolConstants.CRLF)
-            append(config.toString())
-            append(EdgeProtocolConstants.CRLF)
+    private class MemoryCookieJar : CookieJar {
+        private val store = HashMap<String, MutableList<Cookie>>()
+
+        @Synchronized
+        override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+            val list = store.getOrPut(url.host) { ArrayList() }
+            for (c in cookies) {
+                list.removeAll { it.name == c.name && it.domain == c.domain && it.path == c.path }
+                list.add(c)
+            }
         }
-    }
 
-    private val listener = object : WebSocketListener() {
-        override fun onOpen(webSocket: WebSocket, response: Response) {
-            var turn: Session? = null
-            var stale = false
-            synchronized(connLock) {
-                if (socket === webSocket) {
-                    connectionOpen = true
-                    turn = current
-                } else {
-                    stale = true
+        @Synchronized
+        override fun loadForRequest(url: HttpUrl): List<Cookie> {
+            val now = System.currentTimeMillis()
+            val out = ArrayList<Cookie>()
+            for (list in store.values) {
+                for (c in list) {
+                    if (c.expiresAt > now && c.matches(url)) out.add(c)
                 }
             }
-            if (stale) return
-            val t = turn
-            t?.onSocketOpen(webSocket)
-        }
-
-        override fun onMessage(webSocket: WebSocket, text: String) {
-            if (socket !== webSocket) return
-            current?.onText(text)
-        }
-
-        override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-            if (socket !== webSocket) return
-            current?.onBinary(bytes)
-        }
-
-        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-            runCatching { webSocket.close(1000, null) }
-        }
-
-        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            var turn: Session? = null
-            var stale = false
-            synchronized(connLock) {
-                if (socket === webSocket) {
-                    connectionOpen = false
-                    socket = null
-                    turn = current
-                } else {
-                    stale = true
-                }
-            }
-            if (stale) return
-            val t = turn
-            if (t != null && !t.isDone()) {
-                t.onPeerClosed(code, reason)
-            } else {
-                AppLog.i(TAG) { "socket idle closed code=$code reason='${reason.take(40)}'" }
-            }
-        }
-
-        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            var turn: Session? = null
-            var stale = false
-            synchronized(connLock) {
-                if (socket === webSocket) {
-                    connectionOpen = false
-                    socket = null
-                    turn = current
-                } else {
-                    stale = true
-                }
-            }
-            if (stale) {
-                runCatching { response?.body?.close() }
-                return
-            }
-            val s = turn
-            if (s != null && !s.isDone()) {
-                s.onPeerFailure(t, response)
-            } else {
-                AppLog.i(TAG) { "socket idle failure ${t.javaClass.simpleName}" }
-            }
+            return out
         }
     }
 
     companion object {
         private const val TAG = "EdgeTtsClient"
+        private const val BING_PAGE_URL = "https://www.bing.com/translator"
 
-        /** Silence from the server (no frame at all) longer than this = timeout. */
-        private const val IDLE_TIMEOUT_MS: Long = 30_000L
+        private val IG_RE = Regex("IG:\"([^\"]+)\"")
+        private val IID_RE = Regex("data-iid=\"([^\"]+)\"")
+        private val ABUSE_RE =
+            Regex("params_AbusePreventionHelper\\s*=\\s*\\[\\s*(\\d+)\\s*,\\s*\"([^\"]+)\"")
 
-        /** A persistent socket idle longer than this is dropped, not reused. */
-        private const val REUSE_MAX_IDLE_MS: Long = 10_000L
-
-        private val WATCHDOG: ScheduledExecutorService =
-            Executors.newSingleThreadScheduledExecutor { r ->
-                Thread(r, "edge-tts-watchdog").apply { isDaemon = true }
-            }
+        private val WORKER = Executors.newCachedThreadPool { r ->
+            Thread(r, "bing-tts").apply { isDaemon = true }
+        }
 
         private val DIAG_IO = Executors.newSingleThreadExecutor { r ->
             Thread(r, "edge-tts-diag").apply { isDaemon = true }
         }
-
-        private val STATUS_JSON = Regex("\"status\"\\s*:\\s*\"?(\\d{3})\"?")
 
         fun generateSecMsGec(unixSeconds: Long, trustedClientToken: String): String =
             EdgeDrm.generateSecMsGec(unixSeconds, trustedClientToken)
