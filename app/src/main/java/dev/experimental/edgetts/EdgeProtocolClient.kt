@@ -5,10 +5,8 @@ import okhttp3.Cookie
 import okhttp3.CookieJar
 import okhttp3.FormBody
 import okhttp3.HttpUrl
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.IOException
 import java.util.UUID
@@ -19,8 +17,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Drop-in replacement of the old WebSocket client (same public API).
- * Uses the Bing Translator page to obtain a speech token, then calls the
- * regular Azure TTS REST endpoint. Unofficial: may stop working at any time.
+ *
+ * Uses the same route as the Bing Translator page itself:
+ *   1. GET  https://www.bing.com/translator -> IG, IID, abuse-prevention key+token
+ *   2. POST https://www.bing.com/tfettts?isVertical=1&IG=..&IID=..
+ *           form: ssml, token, key           -> MP3 audio (streamed to the caller)
+ *
+ * Unofficial: may stop working whenever Microsoft changes the web page.
  */
 class EdgeProtocolClient(
     private val client: OkHttpClient,
@@ -42,7 +45,7 @@ class EdgeProtocolClient(
         token = trustedClientToken
     )
 
-    /** true when the speech token of the last turn came from the cache. */
+    /** true when the page config of the last turn came from the cache. */
     @Volatile
     var lastReuse: Boolean = false
         private set
@@ -54,21 +57,18 @@ class EdgeProtocolClient(
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    private class Auth(val token: String, val region: String)
+    private class PageConfig(
+        val ig: String,
+        val iid: String,
+        val key: String,
+        val token: String,
+        val host: String,
+        val loadedAt: Long
+    )
 
-    private val authLock = Any()
-    private var pageIg: String? = null
-    private var pageIid: String? = null
-    private var pageKey: String? = null
-    private var pageToken: String? = null
+    private val configLock = Any()
+    private var config: PageConfig? = null
     private var iidCounter = 0
-    private var authToken: String? = null
-    private var authRegion: String? = null
-    private var authExpiresAt: Long = 0L
-
-    @Volatile
-    private var pageHost: String = "www.bing.com"
-
     private var pageHtml: String = ""
     private var pageUrlFinal: HttpUrl? = null
 
@@ -114,31 +114,30 @@ class EdgeProtocolClient(
         override fun cancel() = session.cancel()
     }
 
-    // ------------------------------------------------------------ token flow
+    // ----------------------------------------------------------- page config
 
-    private fun getAuth(forceRefresh: Boolean, diag: (String) -> Unit): Auth =
-        synchronized(authLock) {
+    /** Returns the cached page config, or loads the Bing page again. */
+    private fun getConfig(forceRefresh: Boolean, diag: (String) -> Unit): PageConfig =
+        synchronized(configLock) {
             val now = System.currentTimeMillis()
-            val cached = authToken
-            if (!forceRefresh && cached != null && now < authExpiresAt - 30_000L) {
+            val cached = config
+            if (!forceRefresh && cached != null && now - cached.loadedAt < MAX_CONFIG_AGE_MS) {
                 lastReuse = true
-                Auth(cached, authRegion ?: "southeastasia")
+                cached
             } else {
                 lastReuse = false
-                authToken = null
                 loadPageConfigLocked(diag)
-                requestTokenLocked(diag)
             }
         }
 
-    private fun loadPageConfigLocked(diag: (String) -> Unit) {
+    private fun loadPageConfigLocked(diag: (String) -> Unit): PageConfig {
         val req = Request.Builder()
             .url(BING_PAGE_URL)
             .header("User-Agent", userAgent)
             .header("Accept", "text/html,application/xhtml+xml")
             .header("Accept-Language", "en-US,en;q=0.9")
             .build()
-        http.newCall(req).execute().use { resp ->
+        val result: PageConfig = http.newCall(req).execute().use { resp ->
             val finalUrl = resp.request.url
             val html = resp.body?.string().orEmpty()
             diag("page http=${resp.code} host=${finalUrl.host} bytes=${html.length}")
@@ -154,116 +153,46 @@ class EdgeProtocolClient(
                         "iid=${iid != null}, token=${abuse != null})"
                 )
             }
-            pageIg = ig
-            pageIid = iid
-            pageKey = abuse.groupValues[1]
-            pageToken = abuse.groupValues[2]
-            pageHost = finalUrl.host
             pageHtml = html
             pageUrlFinal = finalUrl
             iidCounter = 0
+            PageConfig(
+                ig = ig,
+                iid = iid,
+                key = abuse.groupValues[1],
+                token = abuse.groupValues[2],
+                host = finalUrl.host,
+                loadedAt = System.currentTimeMillis()
+            )
         }
+        config = result
+        return result
     }
 
-    private fun requestTokenLocked(diag: (String) -> Unit): Auth {
-        val ig = pageIg ?: throw IOException("missing IG")
-        val iid = pageIid ?: throw IOException("missing IID")
+    private fun nextIidSuffix(): Int = synchronized(configLock) {
         iidCounter += 1
-        val url = "https://$pageHost/tfetspktok?isVertical=1&IG=$ig&IID=$iid.$iidCounter"
-        val form = FormBody.Builder()
-            .add("token", pageToken ?: "")
-            .add("key", pageKey ?: "")
-            .build()
-        val req = Request.Builder()
-            .url(url)
-            .post(form)
-            .header("User-Agent", userAgent)
-            .header("Origin", "https://$pageHost")
-            .header("Referer", BING_PAGE_URL)
-            .header("Accept", "*/*")
-            .build()
-        val result: Auth = http.newCall(req).execute().use { resp ->
-            val text = resp.body?.string().orEmpty()
-            diag("tfetspktok http=${resp.code} bytes=${text.length}")
-            if (!resp.isSuccessful) {
-                discoverLocked(diag)
-                throw ProviderHttpException(resp.code, "speech token HTTP ${resp.code}")
-            }
-            val json = try {
-                JSONObject(text)
-            } catch (e: Exception) {
-                throw IOException("speech token reply is not JSON: ${text.take(80)}")
-            }
-            val token = json.optString("token")
-            val region = json.optString("region")
-            if (token.isEmpty() || region.isEmpty()) {
-                throw IOException("speech token reply missing fields: ${text.take(120)}")
-            }
-            val ttl = json.optLong("expiryDurationInMS", 600_000L)
-            authToken = token
-            authRegion = region
-            authExpiresAt = System.currentTimeMillis() + ttl
-            diag("token ok region=$region ttl=${ttl / 1000}s")
-            Auth(token, region)
-        }
-        return result
+        iidCounter
     }
 
     // ------------------------------------------------------------- discovery
 
     /**
-     * Diagnostic only: when the speech-token route answers 404 we look for the
-     * names of the current routes inside the Bing page and its scripts and put
-     * short excerpts into the diagnostics, so the new route can be identified.
+     * Diagnostic only: when the speech route fails we put short excerpts of the
+     * speech-related settings found in the Bing page into the diagnostics.
      */
-    private fun discoverLocked(diag: (String) -> Unit) {
+    private fun describePageLocked(diag: (String) -> Unit) {
         try {
-            val keywords = listOf(
-                "tfetspktok", "tfettts", "spktok", "tts.speech.microsoft.com",
-                "cognitiveservices/v1", "ttsToken", "speechToken", "/tts"
-            )
-            scanText("html", pageHtml, keywords, diag)
-            val base = pageUrlFinal ?: return
-            val srcRe = Regex("<script[^>]+src=\"([^\"]+)\"")
-            val srcs = srcRe.findAll(pageHtml).map { it.groupValues[1] }.distinct().toList()
-            diag("scripts found=${srcs.size}")
-            var fetched = 0
-            for (src in srcs) {
-                if (fetched >= 6) break
-                val url = base.resolve(src) ?: continue
-                if (url.scheme != "https") continue
-                fetched++
-                try {
-                    val req = Request.Builder().url(url).header("User-Agent", userAgent).build()
-                    http.newCall(req).execute().use { r ->
-                        val js = r.body?.string().orEmpty()
-                        val name = url.encodedPath.substringAfterLast('/')
-                        diag("script $name http=${r.code} bytes=${js.length}")
-                        if (r.isSuccessful) scanText(name, js, keywords, diag)
-                    }
-                } catch (e: Exception) {
-                    diag("script fetch failed ${e.javaClass.simpleName}")
+            val html = pageHtml
+            for (kw in listOf("params_TextToSpeechService", "params_SpeechServiceHelper")) {
+                val i = html.indexOf(kw)
+                if (i >= 0) {
+                    val ctx = html.substring(i, minOf(html.length, i + 220))
+                        .replace("\n", " ").replace("\r", " ")
+                    diag("html: $ctx")
                 }
             }
         } catch (e: Exception) {
-            diag("discovery error ${e.javaClass.simpleName}")
-        }
-    }
-
-    private fun scanText(label: String, text: String, keywords: List<String>, diag: (String) -> Unit) {
-        for (kw in keywords) {
-            var from = 0
-            var shown = 0
-            while (shown < 2) {
-                val i = text.indexOf(kw, from)
-                if (i < 0) break
-                val a = maxOf(0, i - 70)
-                val b = minOf(text.length, i + kw.length + 110)
-                val ctx = text.substring(a, b).replace("\n", " ").replace("\r", " ")
-                diag("$label[$kw]: $ctx")
-                shown++
-                from = i + kw.length
-            }
+            diag("describe error ${e.javaClass.simpleName}")
         }
     }
 
@@ -312,17 +241,17 @@ class EdgeProtocolClient(
 
         private fun run() {
             try {
-                var code = 0
+                var retry = false
                 for (attempt in 0..1) {
                     if (cancelled.get()) return
-                    val auth = getAuth(attempt > 0) { logDiag(it) }
-                    code = speak(auth)
-                    if (code == 0) break
-                    logDiag("token rejected http=$code, refreshing")
+                    val cfg = getConfig(attempt > 0) { logDiag(it) }
+                    retry = speak(cfg)
+                    if (!retry) break
+                    logDiag("request rejected, reloading the Bing page")
                 }
                 if (cancelled.get()) return
-                if (code != 0) {
-                    fail(ProviderHttpException(code, "HTTP $code: speech token rejected"))
+                if (retry) {
+                    fail(ProviderHttpException(403, "Bing rejected the request twice"))
                     return
                 }
                 if (!receivedAudio.get()) {
@@ -338,35 +267,58 @@ class EdgeProtocolClient(
             }
         }
 
-        /** Returns 0 on success, or the HTTP code (401/403) when the token was rejected. */
-        private fun speak(auth: Auth): Int {
+        /**
+         * Returns false when audio was delivered (or a hard error was thrown),
+         * true when the request should be repeated with a fresh page config.
+         */
+        private fun speak(cfg: PageConfig): Boolean {
             val ssml = SsmlBuilder.build(voice, locale, rate, pitch, text)
-            val url = "https://${auth.region}.tts.speech.microsoft.com/cognitiveservices/v1"
+            val url = "https://${cfg.host}/tfettts?isVertical=1&IG=${cfg.ig}" +
+                "&IID=${cfg.iid}.${nextIidSuffix()}"
+            val form = FormBody.Builder()
+                .add("ssml", ssml)
+                .add("token", cfg.token)
+                .add("key", cfg.key)
+                .build()
             val req = Request.Builder()
                 .url(url)
-                .post(ssml.toRequestBody("application/ssml+xml; charset=utf-8".toMediaType()))
-                .header("Authorization", "Bearer ${auth.token}")
-                .header("X-Microsoft-OutputFormat", outputFormat)
+                .post(form)
                 .header("User-Agent", userAgent)
-                .header("Origin", "https://$pageHost")
+                .header("Origin", "https://${cfg.host}")
+                .header("Referer", BING_PAGE_URL)
+                .header("Accept", "*/*")
                 .build()
             val call = http.newCall(req)
             activeCall = call
-            val result: Int = call.execute().use { resp ->
-                logDiag("tts http=${resp.code} voice=$voice")
-                if (resp.code == 401 || resp.code == 403) {
-                    return@use resp.code
+            val needsRetry: Boolean = call.execute().use { resp ->
+                val type = resp.header("Content-Type").orEmpty()
+                logDiag("tfettts http=${resp.code} type=$type voice=$voice")
+                if (resp.code == 400 || resp.code == 401 || resp.code == 403) {
+                    return@use true
                 }
                 if (!resp.isSuccessful) {
-                    val msg = resp.body?.string().orEmpty().take(120)
-                    throw ProviderHttpException(resp.code, "TTS HTTP ${resp.code} $msg")
+                    synchronized(configLock) { describePageLocked { logDiag(it) } }
+                    throw ProviderHttpException(resp.code, "TTS HTTP ${resp.code}")
                 }
                 val body = resp.body ?: throw IOException("empty TTS response")
+                if (type.contains("json", true) || type.contains("text", true)) {
+                    val msg = body.string().take(200)
+                    val code = try {
+                        JSONObject(msg).optInt("statusCode", -1)
+                    } catch (e: Exception) {
+                        -1
+                    }
+                    logDiag("tfettts text reply: $msg")
+                    if (code == 205 || code == 401 || code == 400) {
+                        return@use true
+                    }
+                    throw IOException("TTS reply is not audio: $msg")
+                }
                 val input = body.byteStream()
                 val buf = ByteArray(8192)
                 var total = 0
                 while (true) {
-                    if (cancelled.get()) return@use 0
+                    if (cancelled.get()) return@use false
                     val n = input.read(buf)
                     if (n < 0) break
                     if (n > 0) {
@@ -376,9 +328,9 @@ class EdgeProtocolClient(
                     }
                 }
                 logDiag("audio bytes=$total")
-                0
+                false
             }
-            return result
+            return needsRetry
         }
 
         private fun finishOk() {
@@ -424,6 +376,9 @@ class EdgeProtocolClient(
     companion object {
         private const val TAG = "EdgeTtsClient"
         private const val BING_PAGE_URL = "https://www.bing.com/translator"
+
+        /** The page token is valid for about an hour; refresh well before. */
+        private const val MAX_CONFIG_AGE_MS = 40 * 60 * 1000L
 
         private val IG_RE = Regex("IG:\"([^\"]+)\"")
         private val IID_RE = Regex("data-iid=\"([^\"]+)\"")
