@@ -69,7 +69,7 @@ object EdgeProtocolConstants {
     /** [VERIFICADO] Formato primario: el único que usa el cliente de referencia. */
     const val OUTPUT_FORMAT_MP3: String = "audio-24khz-48kbitrate-mono-mp3"
 
-    const val SAMPLE_RATE_HZ: Int = 24000
+    const val SAMPLE_RATE_HZ: Int = 16000
 
     /**
      * Tercer parámetro de SynthesisCallback.start(): NÚMERO de canales.
